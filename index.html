@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rinnegan ASCII Eye</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #07040d; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+  .help {
+    position: fixed; left: 16px; bottom: 12px; margin: 0;
+    font: 11px/1.5 ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    letter-spacing: .04em; color: #a993d8; opacity: .55; pointer-events: none; user-select: none;
+  }
+  body.rec .help, body.clean .help { display: none; }
+  @media (max-width: 600px) { .help { display: none; } }
+</style>
+</head>
+<body>
+<canvas id="c" role="img" aria-label="A close-up ASCII Rinnegan eye: a pale purple iris with concentric ripple rings that awakens, glances around and blinks. Move to make it look at you; hold and release to send a ripple."></canvas>
+<p class="help">move: the eye follows · hold + release: Shinra Tensei · space pause · fan art, not affiliated with Naruto or Shueisha</p>
+<script>
+(() => {
+  'use strict';
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const q = new URLSearchParams(location.search);
+  const clean = q.has('clean'); // ?clean: no labels, for video capture
+  document.body.classList.toggle('clean', clean);
+  const MONO = 'ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace';
+  let CW = 7, CH = 10, FONT = 9; // a finer grid than the other pieces: this one is all about detail (finer still on phones, see resize)
+  const LOOP = 12, STEP = 1 / 60, TAU = Math.PI * 2;
+
+  // ---------- utils ----------
+  function mulberry32(a) {
+    return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+  }
+  function hash2(a, b) { let h = Math.imul(a | 0, 374761393) ^ Math.imul(b | 0, 668265263); h = Math.imul(h ^ h >>> 13, 1274126177); return (h ^ h >>> 16) >>> 0; }
+  const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+  const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+  const easeOut = x => 1 - (1 - x) ** 3;
+  const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a.toFixed(3)})`;
+  const DIRS = ['-', '\\', '|', '/'];
+  const dirGlyph = (x, y) => DIRS[((Math.round(Math.atan2(y, x) / (Math.PI / 4)) % 4) + 4) % 4];
+  const tangent = (dx, dy) => dirGlyph(-dy, dx); // the glyph that runs along a circle at this point
+  const RAMP = ' .:;-=+*#%@';
+
+  const PAL = {
+    bg: [7, 4, 13], skin: [44, 31, 64], lid: [230, 218, 250], iris: [184, 156, 234], deep: [96, 66, 158],
+    ringTile: [22, 11, 40], ringGlyph: [160, 128, 220], sclera: [216, 208, 236], glint: [255, 255, 255],
+    dull: [74, 66, 92], pupil: [4, 2, 9], wave: [198, 168, 255],
+  };
+
+  // ---------- the 12s loop: open, awaken, live, close ----------
+  const blinkAt = 7.2;
+  const blink = t => { const b = Math.abs(t - blinkAt); return b < 0.09 ? 0.1 + 0.9 * b / 0.09 : 1; };
+  const aperture = t => (t < 0.2 ? 0 : t < 1.2 ? easeOut((t - 0.2) / 1) : t < 10.5 ? 1 : 1 - smooth(10.5, 11.4, t)) * blink(t);
+  const awaken = t => smooth(2.0, 3.6, t);                                     // purple floods out from the pupil
+  const ringPop = (k, t) => clamp((t - (2.05 + 0.26 * k)) / 0.3, 0, 1);       // rings draw in one by one, inside out
+  const scriptGaze = t => t < 4.4 ? [0, 0] : t < 5.6 ? [-0.72, -0.08] : t < 6.8 ? [0.75, 0.14] : t < 8.4 ? [0, 0] : t < 9.6 ? [0.2, 0.5] : [0, 0];
+
+  // ---------- state ----------
+  let W = 0, H = 0, dpr = 1, s = 1, t = 0, ft = 0, paused = false, recording = false;
+  const gaze = { x: 0, y: 0 }, fix = { x: 0, y: 0, at: 0 };
+  const pointer = { x: 0, y: 0, inside: false, moved: -1e9, down: false, downAt: 0 };
+  let ripples = [], spring = 0, springV = 0, charge = 0;
+  let rng = mulberry32(3);
+
+  // portrait (phones): let the eye's corners run off screen so the iris stays big enough for the rings
+  const geo = () => { const EW = Math.min((W < H ? 0.8 : 0.44) * W, 1.05 * H), EH = EW * 0.42; return { cx: W / 2, cy: H * 0.52, EW, EH, RI: EH * 0.97 }; };
+
+  function update(dt) {
+    ft += dt;
+    if (!paused) { t += dt; if (t >= LOOP) t -= LOOP; }
+    // gaze: like a real eye it snaps to a fixation point (a saccade) and holds, instead of gliding after the cursor
+    let tx, ty;
+    if (!recording && pointer.inside && performance.now() - pointer.moved < 6000) {
+      const g = geo(); // tanh: small moves near the eye already turn it, the far edges saturate
+      tx = Math.tanh((pointer.x - g.cx) / (g.EW * 0.55)); ty = Math.tanh((pointer.y - g.cy) / (g.EH * 1.4));
+    } else [tx, ty] = scriptGaze(t);
+    const far = Math.hypot(tx - fix.x, ty - fix.y);
+    if (far > 0.15 || (far > 0.03 && ft - fix.at > 0.22)) { fix.x = tx; fix.y = ty; fix.at = ft; }
+    const k = Math.min(1, dt * 32);
+    gaze.x += (fix.x - gaze.x) * k; gaze.y += (fix.y - gaze.y) * k;
+    // Shinra Tensei: rings tighten while held, spring back past rest on release
+    charge = pointer.down && !recording ? Math.min(1, (performance.now() - pointer.downAt) / 1200) : 0;
+    springV += (-196 * spring - 2 * 0.28 * 14 * springV) * dt;
+    spring += springV * dt;
+    ripples = ripples.filter(r => ft - r.t < r.life);
+  }
+
+  // ---------- batching: one fillStyle per colour/alpha bucket ----------
+  const batch = new Map();
+  const put = (kind, col, a, x, y, g) => {
+    if (kind === 'r') a += ((hash2(x, y) & 255) / 255 - 0.5) * 0.07; // grain: breaks colour banding on smooth gradients
+    if (a <= 0.02) return;
+    const key = kind + col + ':' + Math.min(20, Math.round(a * 20));
+    let arr = batch.get(key); if (!arr) batch.set(key, arr = []); arr.push(x, y, g);
+  };
+  function flush() {
+    for (const pass of 'rt') for (const [key, arr] of batch) {
+      if (key[0] !== pass || !arr.length) continue;
+      const [col, a] = key.slice(1).split(':');
+      ctx.fillStyle = rgba(PAL[col], +a / 20);
+      if (pass === 'r') for (let i = 0; i < arr.length; i += 3) ctx.fillRect(arr[i] - CW / 2, arr[i + 1] - CH / 2, CW, CH);
+      else for (let i = 0; i < arr.length; i += 3) ctx.fillText(arr[i + 2], arr[i], arr[i + 1] + 1);
+      arr.length = 0;
+    }
+  }
+
+  // ---------- backdrop: near-black with a faint purple grain and a vignette ----------
+  let backdrop = null;
+  function bakeBackdrop() {
+    backdrop = document.createElement('canvas');
+    backdrop.width = Math.round(W * dpr); backdrop.height = Math.round(H * dpr);
+    const g = backdrop.getContext('2d'); g.scale(dpr, dpr);
+    g.fillStyle = rgba(PAL.bg, 1); g.fillRect(0, 0, W, H);
+    g.font = `${FONT}px ${MONO}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillStyle = rgba(PAL.deep, 0.16);
+    for (let r = 0; r * CH < H; r++) for (let c = 0; c * CW < W; c++) if (hash2(c, r) % 23 === 0) g.fillText('.', c * CW + CW / 2, r * CH + CH / 2);
+    const v = g.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.hypot(W, H) * 0.6);
+    v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(0,0,0,0.6)');
+    g.fillStyle = v; g.fillRect(0, 0, W, H);
+  }
+
+  function draw() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.drawImage(backdrop, 0, 0, W, H);
+    ctx.font = `${FONT}px ${MONO}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    const cols = Math.ceil(W / CW), rows = Math.ceil(H / CH);
+
+    // Shinra Tensei ripples travel out across the dark
+    for (const rp of ripples) {
+      const age = ft - rp.t, R = age * 950 * s, a = rp.s * (1 - age / rp.life);
+      const c0 = Math.max(0, Math.floor((rp.x - R - 20) / CW)), c1 = Math.min(cols - 1, Math.ceil((rp.x + R + 20) / CW));
+      const r0 = Math.max(0, Math.floor((rp.y - R - 20) / CH)), r1 = Math.min(rows - 1, Math.ceil((rp.y + R + 20) / CH));
+      for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
+        const x = c * CW + CW / 2, y = r * CH + CH / 2, dx = x - rp.x, dy = y - rp.y, d = Math.abs(Math.hypot(dx, dy) - R);
+        if (d < CH * 1.6) put('t', 'wave', a * (1 - d / (CH * 1.6)), x, y, tangent(dx, dy));
+        else if (d < CH * 3 && hash2(c, r + (ft * 20 | 0)) % 4 === 0) put('t', 'deep', a * 0.5, x, y, '.');
+      }
+    }
+    flush();
+
+    // the eye
+    const g = geo(), ap = aperture(t), A = awaken(t), RI = g.RI;
+    const gx = gaze.x * g.EW * 0.34, gy = gaze.y * g.EH * 0.3, lw = CH;
+    // the catch-light belongs to the light, not the iris: it stays put while the iris slides under it (dragged along only at the iris edge)
+    let lx = -RI * 0.36 - gx, ly = -RI * 0.38 - gy; const lr = Math.hypot(lx, ly);
+    if (lr > RI * 0.5) { lx *= RI * 0.5 / lr; ly *= RI * 0.5 / lr; }
+    const glx = gx + lx, gly = gy + ly;
+    const c0 = Math.max(0, Math.floor((g.cx - g.EW * 1.35) / CW)), c1 = Math.min(cols - 1, Math.ceil((g.cx + g.EW * 1.35) / CW));
+    const r0 = Math.max(0, Math.floor((g.cy - g.EH * 2.7) / CH)), r1 = Math.min(rows - 1, Math.ceil((g.cy + g.EH * 2) / CH));
+    const jitter = charge * 0.004;
+    for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
+      const sx = c * CW + CW / 2, sy = r * CH + CH / 2, x = sx - g.cx, y = sy - g.cy, ux = x / g.EW;
+      // skin: a soft oval that frames the eye, warmer purple once it awakens
+      const sk = (x / (g.EW * 1.32)) ** 2 + ((y + g.EH * 0.25) / (g.EH * 2.5)) ** 2;
+      const f = Math.max(0, 1 - ux * ux);
+      if (Math.abs(ux) <= 1.02) {
+        if (ap < 0.05) { // closed: one lash line with lashes hanging down
+          const yc = g.EH * 0.18 * f;
+          if (Math.abs(y - yc) < lw * 0.7 && f > 0.01) { put('t', 'lid', 0.85, sx, sy, '='); continue; }
+          if (y > yc && y < yc + lw * (1.5 + 2 * Math.abs(ux)) && hash2(c, 7) % 3 === 0 && f > 0.05) { put('t', 'lid', 0.45, sx, sy, ux > 0.3 ? '\\' : ux < -0.3 ? '/' : '|'); continue; }
+        } else {
+          // the lids ride with the gaze: the upper lid drops when it looks down, lifts a little when it looks up, peaks toward the side it looks at
+          const up = 1 - (gaze.y > 0 ? 0.45 : 0.2) * gaze.y;
+          const yu = -g.EH * ap * up * f ** 0.8 * (1 + 0.1 * ux + 0.15 * gaze.x * ux), yl = g.EH * ap * 0.78 * (1 + 0.1 * gaze.y) * f ** 1.1;
+          if (Math.abs(y - yu) < lw * 0.9 && f > 0.01) { put('t', 'lid', 0.95, sx, sy, Math.abs(ux) > 0.92 ? (ux > 0 ? '\\' : '/') : '#'); continue; }
+          if (y < yu && y > yu - lw * 1.8 && f > 0.05) { put('t', 'lid', 0.6, sx, sy, '='); continue; }
+          const lash = lw * (1.5 + 3.2 * Math.abs(ux) ** 1.4 + (hash2(c, 3) % 3) * 0.6);
+          if (y <= yu - lw * 1.8 && y > yu - lw * 1.8 - lash && hash2(c, 11) % 3 === 0 && f > 0.04) { // upper lashes sweep outward
+            put('t', 'lid', 0.5 * (1 - (yu - lw * 1.8 - y) / lash) + 0.2, sx, sy, ux > 0.25 ? '/' : ux < -0.25 ? '\\' : '|'); continue;
+          }
+          const crease = yu - g.EH * 0.42 * f ** 0.7 - lw * 2;
+          if (Math.abs(y - crease) < lw * 0.5 && f > 0.12) { put('t', 'lid', 0.22, sx, sy, '-'); continue; }
+          if (Math.abs(y - yl) < lw * 0.55 && f > 0.01) { put('t', 'lid', 0.5, sx, sy, '-'); continue; }
+          if (y > yl && y < yl + lw * (0.8 + 1.2 * Math.abs(ux)) && hash2(c, 5) % 5 === 0 && f > 0.06) { put('t', 'lid', 0.28, sx, sy, ux > 0.3 ? '\\' : ux < -0.3 ? '/' : '|'); continue; }
+          if (y > yu && y < yl) { eyeCell(sx, sy, x, y, yu, yl, ux, gx, gy, RI, A, c, r); continue; }
+        }
+      }
+      if (sk < 1) { // skin, with a faint purple glow near the eye once it has awakened
+        const near = Math.max(0, 1 - sk);
+        put('r', 'skin', 0.28 * near, sx, sy, '');
+        if (A > 0) put('r', 'deep', 0.12 * A * near ** 3, sx, sy, '');
+        if (hash2(c, r) % 6 === 0) put('t', 'deep', 0.35 * near, sx, sy, hash2(r, c) % 2 ? '.' : ':');
+      }
+    }
+    flush();
+
+    function eyeCell(sx, sy, x, y, yu, yl, ux, gx, gy, RI, A, c, r) {
+      // the eyeball turns: seen at an angle, the iris narrows along the gaze
+      let dx = (x - gx) / (1 - 0.22 * Math.abs(gaze.x)), dy = (y - gy) / (1 - 0.15 * Math.abs(gaze.y)), rn = Math.hypot(dx, dy) / RI;
+      const lidShade = 1 - 0.5 * (1 - smooth(yu, yu + (yl - yu) * 0.35, y)); // the upper lid casts a shadow
+      if (Math.hypot(x - glx, y - gly) < RI * 0.1) { put('r', 'glint', 0.92, sx, sy, ''); put('t', 'iris', 0.9, sx, sy, '@'); return; }
+      if (rn >= 1) { // the white of the eye, tinted lavender: round, darker at the corners and under the lids
+        const round = 1 - Math.abs(ux) ** 1.6, lower = 1 - 0.35 * smooth(yl - (yl - yu) * 0.25, yl, y);
+        put('r', 'sclera', (0.12 + 0.3 * round) * lidShade * lower, sx, sy, '');
+        if (hash2(c, r) % 4 === 0) put('t', 'deep', (0.25 + 0.2 * (1 - round)) * lidShade, sx, sy, hash2(r, c) % 3 ? '.' : ':');
+        return;
+      }
+      if (rn > 0.955) { put('r', 'ringTile', 1, sx, sy, ''); put('t', 'ringGlyph', 0.45, sx, sy, tangent(dx, dy)); return; } // limbal ring
+      // corneal dome: the middle of the iris shifts toward the gaze more than its rim, so the rings read as a curved lens
+      const lift = 0.16 * (1 - rn) * RI; dx -= lift * gaze.x; dy -= lift * gaze.y; rn = Math.hypot(dx, dy) / RI;
+      if (rn > A) { // not yet awakened: a plain dark iris and a wide pupil
+        if (rn < 0.3 * (1 - A)) { put('r', 'pupil', 1, sx, sy, ''); return; }
+        put('r', 'dull', 0.85 * lidShade, sx, sy, '');
+        put('t', 'deep', 0.6, sx, sy, RAMP[3 + hash2(Math.floor(Math.atan2(dy, dx) / 0.08), Math.floor(rn * 8)) % 4]);
+        return;
+      }
+      if (A < 1 && rn > A - 0.05) { put('r', 'wave', 0.9, sx, sy, ''); put('t', 'pupil', 0.8, sx, sy, '*'); return; } // the flood front
+      // ripple rings: a slow travelling wave, tightened while held, springing back on release, pushed by ripples
+      let ring = 0;
+      for (let k = 0; k < 6; k++) {
+        const pk = ringPop(k, t);
+        if (!pk) continue;
+        let rk = (0.17 + 0.155 * k) * (1 - 0.22 * charge) + spring * 0.08 * (k + 1) / 6 + 0.01 * Math.sin(ft * 1.4 - k * 0.9) + (Math.random() - 0.5) * jitter;
+        for (const rp of ripples) { const age = ft - rp.t; rk += 0.03 * rp.s * Math.exp(-(((rn - age * 2.2) / 0.08) ** 2)) * Math.max(0, 1 - age / rp.life); }
+        if (Math.abs(rn - rk) < Math.max(0.02, 0.55 * CH / RI) + 0.012 * (1 - pk)) { ring = pk; break; } // at least ~half a row thick, or small eyes get gaps
+      }
+      if (ring) { put('r', 'ringTile', 0.95 * ring, sx, sy, ''); put('t', 'ringGlyph', 0.75 * ring * lidShade, sx, sy, tangent(dx, dy)); return; }
+      if (rn < 0.06 + 0.03 * charge) { put('r', 'pupil', 1, sx, sy, ''); put('t', 'deep', 0.6, sx, sy, '@'); return; }
+      // iris body: lighter toward the centre, faint concentric banding, radial fibres as glyph texture
+      const band = 0.06 * Math.cos(rn * TAU * 6.45);
+      const fib = hash2(Math.floor((Math.atan2(dy, dx) + Math.PI) / 0.05), Math.floor(rn * 14)) % 5;
+      const bright = clamp((0.5 + 0.35 * (1 - rn) + band) * lidShade + charge * 0.15, 0, 1);
+      put('r', 'iris', bright, sx, sy, '');
+      put('t', 'deep', 0.45 + 0.1 * fib, sx, sy, RAMP[2 + fib]);
+    }
+
+    if (!clean && !recording) {
+      ctx.font = `11px ${MONO}`; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = rgba(PAL.ringGlyph, 0.8);
+      ctx.textAlign = 'left'; ctx.fillText('輪廻眼  RINNEGAN', 20, 30);
+      ctx.textAlign = 'right'; ctx.fillText(`00:${t.toFixed(1).padStart(4, '0')} / 00:${LOOP.toFixed(1)}`, W - 20, 30);
+    }
+  }
+
+  // ---------- lifecycle ----------
+  function resize() {
+    const box = canvas.getBoundingClientRect();
+    W = Math.round(box.width) || innerWidth; H = Math.round(box.height) || innerHeight;
+    if (!W || !H) return;
+    // when recording, cap to X's upload limits: 1920x1200 landscape, 1200x1900 portrait
+    dpr = recording ? Math.min(devicePixelRatio || 1, W >= H ? Math.min(1920 / W, 1200 / H) : Math.min(1200 / W, 1900 / H)) : Math.min(devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+    s = Math.min(W, H) / 900;
+    [CW, CH, FONT] = Math.min(W, H) < 600 ? [5, 7, 6.5] : [7, 10, 9];
+    bakeBackdrop();
+  }
+
+  let last = performance.now(), acc = 0;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (!W || !H) return;
+    acc += dt;
+    while (acc >= STEP) { update(STEP); acc -= STEP; }
+    draw();
+  }
+
+  function record() {
+    if (recording || !window.MediaRecorder) return;
+    const type = ['video/mp4;codecs=avc1.640028', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm'].find(x => MediaRecorder.isTypeSupported(x));
+    recording = true; paused = false; pointer.down = false; ripples = []; spring = springV = 0; t = 0;
+    document.body.classList.add('rec');
+    resize();
+    const rec = new MediaRecorder(canvas.captureStream(60), { mimeType: type, videoBitsPerSecond: 20e6 });
+    const chunks = [];
+    rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+    rec.onstop = () => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob(chunks, { type }));
+      a.download = `rinnegan.${type.includes('mp4') ? 'mp4' : 'webm'}`;
+      a.click();
+      recording = false; document.body.classList.remove('rec'); resize();
+    };
+    rec.start();
+    setTimeout(() => rec.stop(), LOOP * 1000);
+  }
+
+  const local = e => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+  canvas.addEventListener('pointermove', e => { [pointer.x, pointer.y] = local(e); pointer.inside = true; pointer.moved = performance.now(); });
+  canvas.addEventListener('pointerdown', e => { [pointer.x, pointer.y] = local(e); pointer.down = true; pointer.inside = true; pointer.downAt = performance.now(); pointer.moved = performance.now(); canvas.setPointerCapture(e.pointerId); });
+  canvas.addEventListener('pointerup', () => {
+    if (!pointer.down) return;
+    const c = Math.min(1, (performance.now() - pointer.downAt) / 1200);
+    pointer.down = false;
+    if (recording) return;
+    const g = geo();
+    ripples.push({ x: g.cx, y: g.cy, t: ft, s: 0.35 + 0.65 * c, life: 1.6 }); // the push comes from the eye
+    springV += 2.5 + 3 * c;
+  });
+  canvas.addEventListener('pointerleave', () => { pointer.inside = false; });
+  addEventListener('keydown', e => {
+    if (recording) return;
+    if (e.key === 'r' || e.key === 'R') record();
+    else if (e.key === ' ') { paused = !paused; e.preventDefault(); }
+  });
+  new ResizeObserver(resize).observe(canvas);
+
+  resize();
+  // ?t=4.5 freezes on that moment (for stills); add &play to keep running
+  const warm = clamp(+q.get('t') || 0, 0, LOOP - 0.01);
+  if (warm) { for (let i = 0; i < warm / STEP; i++) update(STEP); paused = !q.has('play'); }
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches && !warm) { for (let i = 0; i < 5 / STEP; i++) update(STEP); paused = true; }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
