@@ -7,4 +7,4 @@ shinra tensei. Every frame is monospace text. One HTML file, no dependencies.
 
 On a phone, drag to make it look around.
 
-Built with Claude Code. Fan art, not affiliated with Naruto or its owners.
+Fan art, not affiliated with Naruto or its owners.
